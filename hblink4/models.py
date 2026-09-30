@@ -336,6 +336,9 @@ class RepeaterState:
     slot2_talkgroups: Optional[set] = None  # Set of 3-byte TGIDs
 
     rpto_received: bool = False  # True if repeater sent RPTO to override config TGs
+    # The last RPTO payload as received, so a config reload can re-apply the repeater's
+    # request against its new pattern (reload_repeaters).
+    rpto_raw: Optional[bytes] = None
 
     # Whether this repeater participates in unit (private) call routing. Seeded
     # from the matched pattern's `default_unit_calls` when the repeater connects,

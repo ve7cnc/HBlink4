@@ -2625,6 +2625,51 @@ class HBProtocol(asyncio.DatagramProtocol):
         
     # ========== INBOUND REPEATER MANAGEMENT ==========
         
+    def reload_repeaters(self, matcher: 'RepeaterMatcher') -> Tuple[int, int]:
+        """Swap in a new RepeaterMatcher and bring every connection up to date in place:
+        its cached talkgroups are rebuilt from its new pattern (and its last RPTO request
+        re-applied against it). A connection whose pattern went away, that is now
+        blacklisted, or whose passphrase changed is disconnected -- that one only; it logs
+        in again under the new config. Nobody else is touched.
+
+        Returns (updated, disconnected)."""
+        from .access_control import BlacklistError
+        old = self._matcher
+        self._matcher = matcher
+        # A login in progress completes against the new config on its next packet.
+        updated = dropped = 0
+        for repeater_id, repeater in list(self._repeaters.items()):
+            rid = rid_to_int(repeater_id)
+            callsign = repeater.get_callsign_str() if repeater.callsign else None
+            try:
+                old_cfg = old.get_repeater_config(rid, callsign)
+            except BlacklistError:
+                old_cfg = None
+            try:
+                new_cfg = matcher.get_repeater_config(rid, callsign)
+                why = None if new_cfg is not None else 'no longer configured'
+            except BlacklistError as e:
+                new_cfg, why = None, f'blacklisted ({e})'
+            if why is None and old_cfg is not None and new_cfg.passphrase != old_cfg.passphrase:
+                why = 'passphrase changed'
+            if why is not None:
+                LOGGER.info(f'🔁 RELOAD: disconnecting {rid}: {why}')
+                if repeater.connection_state == 'connected' and self._port:
+                    try:
+                        self._port.sendto(MSTCL, repeater.sockaddr)
+                    except Exception as e:
+                        LOGGER.error(f'Error sending MSTCL to {rid}: {e}')
+                self._remove_repeater(repeater_id, f'config reload: {why}')
+                dropped += 1
+                continue
+            if repeater.connection_state != 'connected':
+                continue
+            self._load_repeater_tg_config(repeater_id, repeater)
+            if repeater.rpto_raw is not None:
+                self._handle_options(repeater_id, repeater.rpto_raw, repeater.sockaddr)
+            updated += 1
+        return updated, dropped
+
     def _remove_repeater(self, repeater_id: bytes, reason: str) -> None:
         """
         Remove a repeater and clean up all its state.
@@ -3149,7 +3194,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         repeater = self._validate_repeater(repeater_id, addr)
         if not repeater:
             return
-        
+        repeater.rpto_raw = bytes(data)
+
         try:
             # Parse options string
             options_str = data.decode('utf-8', errors='ignore').strip('\x00').strip()
@@ -4341,10 +4387,50 @@ class HBProtocol(asyncio.DatagramProtocol):
 
 # Configuration functions moved to config.py
 
+CONFIG_FILE = ''
+
+
 def load_config(config_file: str):
     """Wrapper for config module load_config - maintains global CONFIG"""
-    global CONFIG
+    global CONFIG, CONFIG_FILE
     CONFIG = load_config_func(config_file, LOGGER)
+    CONFIG_FILE = config_file
+
+# Sections a reload applies. Everything else (listeners, outbound connections,
+# OpenBridge trunks, the dashboard link) is read only at startup: a change there is
+# reported and needs a restart.
+RELOADABLE = ('repeater_configurations', 'blacklist')
+
+
+def reload_config(config_file: str, protocols) -> bool:
+    """Re-read the config file and apply its repeater patterns and blacklist in place
+    (SIGHUP). A file that does not load or validate changes nothing: the running
+    config stays. Logs `CONFIG RELOADED ...` or `CONFIG RELOAD FAILED: ...`."""
+    try:
+        new = load_config_func(config_file, LOGGER)
+        matcher = RepeaterMatcher(new)
+    except (SystemExit, Exception) as e:          # load_config exits on a bad file
+        LOGGER.error(f'CONFIG RELOAD FAILED: {config_file}: {type(e).__name__}: {e} '
+                     f'-- keeping the running config')
+        return False
+    later = sorted(k for k in set(new) | set(CONFIG)
+                   if k not in RELOADABLE and not k.startswith('_') and new.get(k) != CONFIG.get(k))
+    if later:
+        LOGGER.warning(f'CONFIG RELOAD: {", ".join(later)} changed -- needs a restart, not applied')
+    for key in RELOADABLE:                        # in place: every holder of CONFIG sees it
+        if key in new:
+            CONFIG[key] = new[key]
+        else:
+            CONFIG.pop(key, None)
+    updated = dropped = 0
+    for protocol in protocols:
+        u, d = protocol.reload_repeaters(matcher)
+        updated, dropped = updated + u, dropped + d
+    LOGGER.info(f'CONFIG RELOADED from {config_file}: {len(matcher.patterns)} patterns, '
+                f'{len(matcher.blacklist)} blacklist entries; {updated} connection(s) updated '
+                f'in place, {dropped} disconnected')
+    return True
+
 
 def parse_outbound_connections() -> List[OutboundConnectionConfig]:
     """Wrapper for config module parse_outbound_connections"""
@@ -4481,6 +4567,8 @@ async def async_main():
     
     loop.add_signal_handler(signal.SIGINT, lambda: handle_shutdown(signal.SIGINT))
     loop.add_signal_handler(signal.SIGTERM, lambda: handle_shutdown(signal.SIGTERM))
+    # SIGHUP: reload repeater patterns and blacklist without dropping anyone.
+    loop.add_signal_handler(signal.SIGHUP, lambda: reload_config(CONFIG_FILE, protocols))
     
     # Run until shutdown signal received
     try:
