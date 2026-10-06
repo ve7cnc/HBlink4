@@ -271,6 +271,10 @@ class HBProtocol(asyncio.DatagramProtocol):
         else:
             repeater.slot2_talkgroups = None
 
+        # The pattern's own slot remaps (trust not needed: the config set them). A
+        # trusted repeater's RPTO translations may replace them later.
+        repeater.inbound_map, repeater.outbound_map = self._pattern_maps(repeater_id, repeater_config)
+
         # Seed unit-call participation from the pattern default. RPTO may
         # later override this with an explicit UNIT=true|false entry.
         repeater.unit_calls_enabled = repeater_config.default_unit_calls
@@ -3127,6 +3131,26 @@ class HBProtocol(asyncio.DatagramProtocol):
             ))
         return (subscription_tgids, translations)
 
+    def _pattern_maps(self, repeater_id: bytes, repeater_config
+                      ) -> Tuple[Dict[Tuple[int, bytes], Tuple[int, bytes]],
+                                 Dict[Tuple[int, bytes], Tuple[int, bytes]]]:
+        """(inbound, outbound) translation maps from the pattern's `translations`
+        (RepeaterConfig, validated at load). Empty maps when it has none."""
+        spec = getattr(repeater_config, 'translations', None) or {}
+        translations: List[Tuple[int, bytes, int, bytes, int]] = []
+        for net_slot, entries in sorted(spec.items()):
+            for entry in entries:
+                try:
+                    _, xlates = self._parse_rpto_translation_entry(int(net_slot), entry)
+                except ValueError as e:
+                    LOGGER.error(f'Pattern translation "{entry}" for repeater '
+                                 f'{rid_to_int(repeater_id)} ignored: {e}')
+                    continue
+                translations.extend(xlates)
+        if not translations:
+            return {}, {}
+        return self._build_translation_maps(repeater_id, translations)
+
     def _build_translation_maps(self, repeater_id: bytes,
                                 translations: List[Tuple[int, bytes, int, bytes, int]]
                                 ) -> Tuple[Dict[Tuple[int, bytes], Tuple[int, bytes]],
@@ -3300,6 +3324,21 @@ class HBProtocol(asyncio.DatagramProtocol):
                         )
                         unit_calls_override = None
             
+            # The pattern's remaps stand unless a trusted repeater declares its own.
+            # A repeater names talkgroups by the slot it hears them on, so a request
+            # for one the pattern moves to another local slot is a request for its
+            # network slot.
+            pattern_in, pattern_out = self._pattern_maps(repeater_id, repeater_config)
+            use_pattern_maps = not (repeater_config.trust and translations)
+            if use_pattern_maps and pattern_in:
+                moves = [(s_, tg, pattern_in[(s_, tg)])
+                         for s_, req in ((1, requested_ts1), (2, requested_ts2))
+                         for tg in req if (s_, tg) in pattern_in]
+                for s_, tg, (n_slot, n_tg) in moves:
+                    (requested_ts1 if s_ == 1 else requested_ts2).discard(tg)
+                for s_, tg, (n_slot, n_tg) in moves:
+                    (requested_ts1 if n_slot == 1 else requested_ts2).add(n_tg)
+
             # Check if this repeater is trusted
             if repeater_config.trust:
                 # Trusted repeater: requested TGs are taken as-is; slots the
@@ -3385,15 +3424,16 @@ class HBProtocol(asyncio.DatagramProtocol):
                     f'⚠️  Repeater {rid_to_int(repeater_id)} sent translation syntax '
                     f'but is not trusted — translation rules ignored'
                 )
-                new_inbound: Dict[Tuple[int, bytes], Tuple[int, bytes]] = {}
-                new_outbound: Dict[Tuple[int, bytes], Tuple[int, bytes]] = {}
+                new_inbound, new_outbound = pattern_in, pattern_out
                 new_tx_src_override: Optional[bytes] = None
             elif repeater_config.trust:
-                new_inbound, new_outbound = self._build_translation_maps(repeater_id, translations)
+                if use_pattern_maps:
+                    new_inbound, new_outbound = pattern_in, pattern_out
+                else:
+                    new_inbound, new_outbound = self._build_translation_maps(repeater_id, translations)
                 new_tx_src_override = tx_src_override
             else:
-                new_inbound = {}
-                new_outbound = {}
+                new_inbound, new_outbound = pattern_in, pattern_out
                 new_tx_src_override = None
 
             # Warn if RPTO arrives mid-stream; apply anyway (asyncio is single

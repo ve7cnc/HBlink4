@@ -69,6 +69,30 @@ class RepeaterConfig:
     # Per-pattern default for unit (private) call participation. Repeaters can
     # override via UNIT=true|false in RPTO. Absent UNIT in RPTO = use this.
     default_unit_calls: bool = False
+    # Server-side slot/talkgroup remaps, set by whoever writes the config (so they
+    # apply to untrusted repeaters too): {"<net slot>": ["<net tgid>:<local slot>[:<local
+    # tgid>]", ...]}, the RPTO translation grammar. E.g. {"2": ["3027:1"]} delivers
+    # network TS2/3027 on the repeater's TS1, and takes its TS1/3027 as network TS2/3027.
+    # A trusted repeater's own RPTO translations replace these.
+    translations: Optional[Dict[str, List[str]]] = None
+
+    def __post_init__(self):
+        if self.translations is None:
+            return
+        if not isinstance(self.translations, dict):
+            raise ValueError('translations must be an object keyed by network slot')
+        for slot, entries in self.translations.items():
+            if str(slot) not in ('1', '2'):
+                raise ValueError(f'translations: network slot must be 1 or 2, got {slot!r}')
+            if not isinstance(entries, list):
+                raise ValueError(f'translations[{slot!r}] must be a list')
+            for e in entries:
+                if not isinstance(e, str) or not _TRANSLATION.match(e):
+                    raise ValueError(f'translations[{slot!r}]: {e!r} is not '
+                                     f'"<net tgid>[-<net tgid>]:<local slot>[:<local tgid>]"')
+
+
+_TRANSLATION = re.compile(r'^\s*\d+(-\d+)?\s*:\s*[12*]?\s*(:\s*(\d+|\*)\s*)?$')
 
 @dataclass
 class PatternMatch:
