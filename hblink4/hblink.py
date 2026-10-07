@@ -64,7 +64,7 @@ from .protocol import (
 )
 from .models import (
     OutboundConnectionConfig, StreamState, OutboundState, RepeaterState,
-    OpenBridgeConnectionConfig, OpenBridgeState
+    OpenBridgeConnectionConfig, OpenBridgeState, PttActivation
 )
 from .lc import (
     LC_OPT_GROUP_DEFAULT, LC_CARRIER_NONE, LC_CARRIER_VHEAD,
@@ -237,6 +237,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             'slot2_talkgroups': self._format_tg_json(repeater.slot2_talkgroups),
             'rpto_received': repeater.rpto_received,
             'translations': translations_list,
+            'ptt_active': self._ptt_json(repeater),
+            'ptt_timeout': repeater.ptt_timeout if repeater.ptt_talkgroups is not None else None,
             'last_ping': repeater.last_ping,
             'missed_pings': repeater.missed_pings,
             # Authoritative session start. The dashboard must use this rather than
@@ -274,6 +276,13 @@ class HBProtocol(asyncio.DatagramProtocol):
         # The pattern's own slot remaps (trust not needed: the config set them). A
         # trusted repeater's RPTO translations may replace them later.
         repeater.inbound_map, repeater.outbound_map = self._pattern_maps(repeater_id, repeater_config)
+
+        # PTT envelope and timeout follow the pattern; activations already running stay.
+        repeater.ptt_talkgroups = ({tg.to_bytes(3, 'big') for tg in repeater_config.ptt_talkgroups}
+                                   if repeater_config.ptt_talkgroups is not None else None)
+        repeater.ptt_timeout = float(repeater_config.ptt_timeout)
+        repeater.ptt_slot = repeater_config.ptt_slot
+        self._ptt_restore(repeater)
 
         # Seed unit-call participation from the pattern default. RPTO may
         # later override this with an explicit UNIT=true|false entry.
@@ -1155,7 +1164,11 @@ class HBProtocol(asyncio.DatagramProtocol):
         self._tasks.append(
             asyncio.create_task(self._run_periodic(60, self._cleanup_user_cache, "user cache cleanup"))
         )
-        LOGGER.info('Periodic tasks started (repeater timeout, stream timeout, user cache cleanup)')
+        # PTT activation expiry: one sweep for every connection
+        self._tasks.append(
+            asyncio.create_task(self._run_periodic(PTT_SWEEP_INTERVAL, self._ptt_sweep, "PTT expiry sweep"))
+        )
+        LOGGER.info('Periodic tasks started (repeater timeout, stream timeout, user cache cleanup, PTT expiry)')
         
 
 
@@ -1271,6 +1284,10 @@ class HBProtocol(asyncio.DatagramProtocol):
             end_reason
         )
         
+        # Local traffic renews a PTT activation; network traffic (assumed) never does.
+        if not stream.is_assumed and not stream.is_unit_call:
+            self._ptt_renew(repeater_id, slot, stream.dst_id, current_time)
+
         # Decrement active calls counter if this was an assumed (TX) stream
         if stream.is_assumed:
             self._active_calls -= 1
@@ -1653,12 +1670,12 @@ class HBProtocol(asyncio.DatagramProtocol):
         if allowed_tgids is None:
             return True
         
-        # Empty set means deny all
-        if not allowed_tgids:
-            return False
-        
         # O(1) set membership check with no bytes→int conversion!
-        return dst_id in allowed_tgids
+        if dst_id in allowed_tgids:
+            return True
+
+        # Not full time: a PTT activation may carry it
+        return bool(repeater.ptt_active) and self._ptt_carries(repeater, slot, dst_id)
     
     def _check_outbound_routing(self, repeater_id: bytes, slot: int, dst_id: bytes) -> bool:
         """
@@ -1687,12 +1704,132 @@ class HBProtocol(asyncio.DatagramProtocol):
         if allowed_tgids is None:
             return True
         
-        # Empty set means deny all
-        if not allowed_tgids:
-            return False
-        
         # O(1) set membership check with no bytes→int conversion!
-        return dst_id in allowed_tgids
+        if dst_id in allowed_tgids:
+            return True
+
+        # Full time or PTT activated, nothing else
+        return bool(repeater.ptt_active) and self._ptt_carries(repeater, slot, dst_id)
+
+    # ========== PTT ACTIVATION ==========
+    #
+    # A repeater's pattern may carry `ptt_talkgroups`: talkgroups it may bring up by
+    # keying them. Each LOCAL slot carries at most one activation, renewed only by the
+    # repeater's own traffic and dropped `ptt_timeout` seconds after the last of it.
+    # Activations are runtime state: a config reload replaces the envelope and the full
+    # time lists and leaves them alone (an activation whose talkgroup left the envelope
+    # runs out its timer and cannot be renewed).
+
+    def _ptt_live(self, repeater: RepeaterState, act: PttActivation, now: float) -> bool:
+        return now - act.last_heard < repeater.ptt_timeout
+
+    def _ptt_carries(self, repeater: RepeaterState, net_slot: int, dst_id: bytes) -> bool:
+        """True when a live activation carries network (net_slot, dst_id)."""
+        now = time()
+        return any(a.tgid == dst_id and a.net_slot == net_slot and self._ptt_live(repeater, a, now)
+                   for a in repeater.ptt_active.values())
+
+    def _ptt_full_time(self, repeater: RepeaterState, net_slot: int, dst_id: bytes) -> bool:
+        allowed = repeater.slot1_talkgroups if net_slot == 1 else repeater.slot2_talkgroups
+        return allowed is None or dst_id in allowed
+
+    def _ptt_uplink(self, repeater: RepeaterState, slot: int, dst_id: bytes) -> None:
+        """A group stream is starting FROM this repeater on local (slot, dst_id): activate
+        or renew. Runs before the inbound ACL check, which then sees the activation."""
+        if repeater.ptt_talkgroups is None and not repeater.ptt_active:
+            return
+        now = time()
+        allowed = repeater.ptt_talkgroups or ()
+        act = repeater.ptt_active.get(slot)
+        if act is not None and act.tgid == dst_id and self._ptt_live(repeater, act, now):
+            if dst_id in allowed:                 # out of the envelope: runs out, never renewed
+                act.last_heard = now
+                self._ptt_emit(repeater)
+            return
+        if dst_id not in allowed:
+            return                                # the ACL refuses it, and logs that
+        if (slot, dst_id) in repeater.inbound_map and not self._ptt_owns(repeater, slot, dst_id):
+            return                                # a configured remap: full time
+        net_slot = repeater.ptt_slot or slot
+        if self._ptt_full_time(repeater, net_slot, dst_id):
+            return                                # already on: no redundant activation
+        for other_slot, other in list(repeater.ptt_active.items()):
+            if other.tgid == dst_id or other_slot == slot:
+                self._ptt_drop(repeater, other_slot, 'replaced', emit=False)
+        new = PttActivation(tgid=dst_id, net_slot=net_slot, last_heard=now)
+        repeater.ptt_active[slot] = new
+        self._ptt_map(repeater, slot, new)
+        LOGGER.info(f'PTT activated on repeater {rid_to_int(repeater.repeater_id)} '
+                    f'{fmt_ts_tg(net_slot, dst_id, slot, dst_id)} for {repeater.ptt_timeout:.0f}s')
+        self._ptt_emit(repeater)
+
+    def _ptt_renew(self, repeater_id: bytes, slot: int, dst_id: bytes, now: float) -> None:
+        """A stream FROM this repeater ended on local (slot, dst_id): its activation runs
+        from now. (`repeater_id` may be a synthetic id for an outbound connection.)"""
+        repeater = self._repeaters.get(repeater_id)
+        if repeater is None:
+            return
+        act = repeater.ptt_active.get(slot)
+        if (act is not None and act.tgid == dst_id and repeater.ptt_talkgroups
+                and dst_id in repeater.ptt_talkgroups and self._ptt_live(repeater, act, now)):
+            act.last_heard = now
+            self._ptt_emit(repeater)
+
+    def _ptt_owns(self, repeater: RepeaterState, slot: int, dst_id: bytes) -> bool:
+        act = repeater.ptt_active.get(slot)
+        return (act is not None and act.tgid == dst_id and act.net_slot != slot
+                and repeater.inbound_map.get((slot, dst_id)) == (act.net_slot, dst_id))
+
+    def _ptt_map(self, repeater: RepeaterState, slot: int, act: PttActivation) -> None:
+        """An activation keyed on another slot than it is carried on: remap it, as a
+        pattern translation would, without displacing one."""
+        if act.net_slot == slot:
+            return
+        net, local = (act.net_slot, act.tgid), (slot, act.tgid)
+        if local in repeater.inbound_map or net in repeater.outbound_map:
+            return
+        repeater.inbound_map = {**repeater.inbound_map, local: net}
+        repeater.outbound_map = {**repeater.outbound_map, net: local}
+
+    def _ptt_drop(self, repeater: RepeaterState, slot: int, why: str, emit: bool = True) -> None:
+        act = repeater.ptt_active.pop(slot, None)
+        if act is None:
+            return
+        net, local = (act.net_slot, act.tgid), (slot, act.tgid)
+        if act.net_slot != slot and repeater.inbound_map.get(local) == net \
+                and repeater.outbound_map.get(net) == local:
+            repeater.inbound_map = {k: v for k, v in repeater.inbound_map.items() if k != local}
+            repeater.outbound_map = {k: v for k, v in repeater.outbound_map.items() if k != net}
+        LOGGER.info(f'PTT {why} on repeater {rid_to_int(repeater.repeater_id)} '
+                    f'{fmt_ts_tg(act.net_slot, act.tgid, slot, act.tgid)}')
+        if emit:
+            self._ptt_emit(repeater)
+
+    def _ptt_restore(self, repeater: RepeaterState) -> None:
+        """The connection's maps were just rebuilt (login, RPTO, reload): put the running
+        activations' remaps back. The activations themselves are never touched here."""
+        for slot, act in repeater.ptt_active.items():
+            self._ptt_map(repeater, slot, act)
+
+    def _ptt_sweep(self) -> None:
+        """Drop every activation whose timer has run out."""
+        now = time()
+        for repeater in list(self._repeaters.values()):
+            for slot, act in list(repeater.ptt_active.items()):
+                if not self._ptt_live(repeater, act, now):
+                    self._ptt_drop(repeater, slot, 'expired')
+
+    def _ptt_json(self, repeater: RepeaterState) -> list:
+        return [{'slot': slot, 'talkgroup': int.from_bytes(a.tgid, 'big'), 'net_slot': a.net_slot,
+                 'last_heard': a.last_heard, 'expires': a.last_heard + repeater.ptt_timeout}
+                for slot, a in sorted(repeater.ptt_active.items())]
+
+    def _ptt_emit(self, repeater: RepeaterState) -> None:
+        self._events.emit('repeater_ptt', {
+            'repeater_id': rid_to_int(repeater.repeater_id),
+            'ptt_active': self._ptt_json(repeater),
+            'ptt_timeout': repeater.ptt_timeout,
+        })
     
     def _is_slot_busy(self, repeater_id: bytes, slot: int, stream_id: bytes,
                      rf_src: bytes = None, dst_id: bytes = None,
@@ -2165,6 +2302,9 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # Deny the new stream - first come, first served
                 return False
         
+        # Keying a PTT talkgroup brings it up (or renews it) before the ACL looks
+        self._ptt_uplink(repeater, slot, dst_id)
+
         # Check if this repeater is allowed to send traffic on this TS/TGID (inbound routing)
         if not self._check_inbound_routing(repeater.repeater_id, slot, dst_id):
             # Track denied streams to avoid logging every packet
@@ -3235,6 +3375,11 @@ class HBProtocol(asyncio.DatagramProtocol):
             # None = allow all TGs, [] = deny all, [1,2,3] = specific TGs
             config_ts1 = {tg.to_bytes(3, 'big') for tg in repeater_config.slot1_talkgroups} if repeater_config.slot1_talkgroups is not None else None
             config_ts2 = {tg.to_bytes(3, 'big') for tg in repeater_config.slot2_talkgroups} if repeater_config.slot2_talkgroups is not None else None
+            # What an untrusted request is intersected with: the whole envelope, full
+            # time and PTT. A declared talkgroup becomes full time.
+            envelope = {tg.to_bytes(3, 'big') for tg in repeater_config.ptt_talkgroups or ()}
+            allow_ts1 = config_ts1 | envelope if config_ts1 is not None else None
+            allow_ts2 = config_ts2 | envelope if config_ts2 is not None else None
             
             # Parse RPTO: TS1=.../TS2=... can hold translation syntax per entry.
             # SRC= declares a single rf_src override applied to every group-voice
@@ -3367,26 +3512,26 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # only intersect with config when config has explicit TGs.
                 if not seen_ts1:
                     final_ts1 = config_ts1
-                elif config_ts1 is None:
+                elif allow_ts1 is None:
                     final_ts1 = requested_ts1
                 else:
-                    final_ts1 = requested_ts1 & config_ts1
+                    final_ts1 = requested_ts1 & allow_ts1
 
                 if not seen_ts2:
                     final_ts2 = config_ts2
-                elif config_ts2 is None:
+                elif allow_ts2 is None:
                     final_ts2 = requested_ts2
                 else:
-                    final_ts2 = requested_ts2 & config_ts2
+                    final_ts2 = requested_ts2 & allow_ts2
 
                 # Log any requested TGs that were rejected (only when config has restrictions)
-                if config_ts1 is not None:
-                    rejected_ts1 = requested_ts1 - config_ts1
+                if allow_ts1 is not None:
+                    rejected_ts1 = requested_ts1 - allow_ts1
                 else:
                     rejected_ts1 = set()  # No rejections when config allows all
 
-                if config_ts2 is not None:
-                    rejected_ts2 = requested_ts2 - config_ts2
+                if allow_ts2 is not None:
+                    rejected_ts2 = requested_ts2 - allow_ts2
                 else:
                     rejected_ts2 = set()
             
@@ -3455,6 +3600,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             repeater.inbound_map = new_inbound
             repeater.outbound_map = new_outbound
             repeater.tx_src_override = new_tx_src_override
+            self._ptt_restore(repeater)
 
             # Log final TG lists (handle None = allow all)
             LOGGER.info(f'  → TS1 TGs: {self._format_tg_display(final_ts1)}')
@@ -4428,6 +4574,7 @@ class HBProtocol(asyncio.DatagramProtocol):
 # Configuration functions moved to config.py
 
 CONFIG_FILE = ''
+PTT_SWEEP_INTERVAL = 5.0     # seconds between PTT expiry sweeps (delivery checks expiry itself)
 
 
 def load_config(config_file: str):

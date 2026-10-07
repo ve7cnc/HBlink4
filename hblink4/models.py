@@ -283,6 +283,15 @@ class OpenBridgeState:
 
 
 @dataclass
+class PttActivation:
+    """A talkgroup a repeater brought up by keying it (RepeaterConfig.ptt_talkgroups).
+    Runtime only: it lives and dies with the connection, and a config reload keeps it."""
+    tgid: bytes             # 3-byte TGID, the same on both sides (only the slot moves)
+    net_slot: int           # the network slot it is carried on
+    last_heard: float       # last LOCAL traffic on it; network traffic never renews
+
+
+@dataclass
 class RepeaterState:
     """
     Data class for storing inbound connection state.
@@ -364,6 +373,14 @@ class RepeaterState:
     # the rest of the network sees all traffic from this repeater as originating
     # from a single radio ID. None = no rewrite (default).
     tx_src_override: Optional[bytes] = None
+
+    # PTT activation (RepeaterConfig.ptt_*). The envelope and timeout follow the
+    # pattern (a reload replaces them); `ptt_active` is runtime state, keyed by the
+    # LOCAL slot it was keyed on, at most one per slot, and a reload never touches it.
+    ptt_talkgroups: Optional[set] = None    # 3-byte TGIDs; None = no PTT activation
+    ptt_timeout: float = 900.0
+    ptt_slot: Optional[int] = None
+    ptt_active: Dict[int, PttActivation] = field(default_factory=dict)
     
     # Active stream tracking per slot
     slot1_stream: Optional[StreamState] = None

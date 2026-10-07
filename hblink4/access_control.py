@@ -75,8 +75,27 @@ class RepeaterConfig:
     # network TS2/3027 on the repeater's TS1, and takes its TS1/3027 as network TS2/3027.
     # A trusted repeater's own RPTO translations replace these.
     translations: Optional[Dict[str, List[str]]] = None
+    # PTT activation. Talkgroups not on the slot lists above that the repeater may
+    # still bring up by keying them: each slot then carries the one it keyed last until
+    # `ptt_timeout` seconds pass with no local traffic on it. None = no PTT activation.
+    # Runtime state only -- activations live on the connection, never in this config.
+    ptt_talkgroups: Optional[List[int]] = None
+    ptt_timeout: int = 900
+    # The network slot an activation lives on. None = the slot it was keyed on. A
+    # hotspot server that puts every talkgroup on one network slot sets it, so a
+    # talkgroup keyed on the other slot is heard back on that one.
+    ptt_slot: Optional[int] = None
 
     def __post_init__(self):
+        if self.ptt_talkgroups is not None and (
+                not isinstance(self.ptt_talkgroups, list)
+                or not all(isinstance(t, int) and 0 < t < 0x1000000 for t in self.ptt_talkgroups)):
+            raise ValueError('ptt_talkgroups must be a list of talkgroup numbers')
+        if isinstance(self.ptt_timeout, bool) or not isinstance(self.ptt_timeout, int) \
+                or self.ptt_timeout <= 0:
+            raise ValueError('ptt_timeout must be a positive number of seconds')
+        if self.ptt_slot not in (None, 1, 2):
+            raise ValueError('ptt_slot must be 1 or 2')
         if self.translations is None:
             return
         if not isinstance(self.translations, dict):

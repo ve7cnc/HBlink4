@@ -593,6 +593,9 @@ Multiple match types in a single pattern are combined with OR logic (any match t
 | `slot2_talkgroups` | array | List of allowed talkgroup IDs for timeslot 2 (bidirectional) |
 | `trust` | boolean | If true, repeater can use any TG (config TGs become defaults) |
 | `default_unit_calls` | boolean | Default unit (private) call participation for repeaters matching this pattern. Repeaters can override via `UNIT=true\|false` in RPTO. (default: `false`) |
+| `ptt_talkgroups` | array | Talkgroups the repeater may bring up by keying them (PTT activation). See [PTT Activation](#ptt-activation). Absent = none |
+| `ptt_timeout` | integer | Seconds a PTT activation lasts after the repeater's own last transmission on it (default: `900`) |
+| `ptt_slot` | 1 or 2 | Network slot PTT activations are carried on. Absent = the slot they were keyed on |
 
 **Symmetric Routing:**
 The same talkgroup lists control BOTH directions:
@@ -730,6 +733,43 @@ Options = "TS1=9:2:32;SRC=9990001"         ; translation + outbound rf_src overr
 ```
 
 When an RPTO with translation arrives during an active stream, the new rules are applied immediately (a warning is logged); the in-flight stream will finish on its old rules within a few seconds.
+
+### PTT Activation
+
+The slot lists are a pattern's **full time** talkgroups: always delivered. `ptt_talkgroups`
+adds talkgroups the repeater may use by keying them:
+
+```json
+"config": {
+    "passphrase": "my-secret-key",
+    "slot1_talkgroups": [],
+    "slot2_talkgroups": [3027, 302],
+    "ptt_talkgroups": [3026, 3100, 31771],
+    "ptt_timeout": 900,
+    "ptt_slot": 2
+}
+```
+
+- Keying a talkgroup in `ptt_talkgroups` that is not full time activates it on the slot it
+  was keyed on. Each slot carries at most one activation: keying another replaces it.
+- Traffic is delivered to the repeater when it is full time **or** the slot's activation.
+- Only the repeater's **own** traffic renews an activation. Network traffic arriving on it
+  never does, so a busy talkgroup still drops `ptt_timeout` seconds after the repeater
+  last keyed it. Expiry is one periodic sweep over every connection.
+- A talkgroup keyed outside `ptt_talkgroups` (and not full time) is refused and logged.
+- `ptt_slot` is for a server that carries every talkgroup on one network slot (a hotspot
+  server whose OpenBridge `talkgroup_slots` puts them all on TS2): a talkgroup keyed on the
+  other local slot is carried on `ptt_slot` and delivered back on the slot it was keyed on.
+- RPTO: an untrusted repeater's requested talkgroups are intersected with the full time
+  lists **plus** `ptt_talkgroups`; what it declares becomes full time.
+- Activations are runtime state. A SIGHUP reload replaces the full time lists, the envelope
+  and the timeout, and leaves every activation in place. One whose talkgroup left the
+  envelope runs out its timer (it is not cut mid-QSO) and cannot be renewed.
+- Activations are reported in a `repeater_ptt` event on every change, and as `ptt_active`
+  (slot, talkgroup, net_slot, last_heard, expires) and `ptt_timeout` in the repeater state
+  events.
+
+`scripts/ptt_live_test.py` exercises this against a running server with simulated hotspots.
 
 ### Pattern Matching Priority
 
