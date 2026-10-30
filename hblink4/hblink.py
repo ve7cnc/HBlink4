@@ -2572,7 +2572,8 @@ class HBProtocol(asyncio.DatagramProtocol):
 
     def _calculate_unit_call_targets(self, source_repeater_id: Optional[bytes], slot: int,
                                       rf_src: bytes, dst_id: bytes, stream_id: bytes,
-                                      source_outbound_name: Optional[str] = None) -> Tuple[set, bool]:
+                                      source_outbound_name: Optional[str] = None,
+                                      source_openbridge_name: Optional[str] = None) -> Tuple[set, bool]:
         """
         Build the target set for a unit call.
 
@@ -2603,7 +2604,9 @@ class HBProtocol(asyncio.DatagramProtocol):
             (target_set, is_broadcast)
         """
         dst_int = bytes_to_int(dst_id)
-        from_outbound = source_outbound_name is not None
+        # A call that came in over a link (outbound or OpenBridge) never goes back out
+        # over any link: each network fans out within itself (RPF-style anti-loop).
+        from_outbound = source_outbound_name is not None or source_openbridge_name is not None
 
         # Cache hit path
         if self._user_cache:
@@ -2630,6 +2633,10 @@ class HBProtocol(asyncio.DatagramProtocol):
                             and not self._is_outbound_slot_busy(outbound, slot, stream_id,
                                                                 rf_src, dst_id, is_unit_call=True)):
                         return ({('outbound', ident)}, False)
+                elif kind == 'openbridge' and not from_outbound:
+                    obp = self._openbridges.get(ident)
+                    if obp is not None and obp.transport is not None and obp.config.unit_calls:
+                        return ({('openbridge', ident)}, False)
                 # Cache hit but target ineligible (or cross-outbound forwarding
                 # suppressed) — fall through to broadcast.
 
@@ -2659,6 +2666,9 @@ class HBProtocol(asyncio.DatagramProtocol):
                                                rf_src, dst_id, is_unit_call=True):
                     continue
                 target_set.add(('outbound', conn_name))
+            for obp_name, obp in self._openbridges.items():
+                if obp.transport is not None and obp.config.unit_calls:
+                    target_set.add(('openbridge', obp_name))
 
         return (target_set, True)
 
@@ -4043,8 +4053,10 @@ class HBProtocol(asyncio.DatagramProtocol):
                 if not obp:
                     continue
                 dmrd53 = build_target_packet(net_slot, net_dst_id, net_rf_src, None)
+                wire_slot = (self._obp_unit_wire_slot(target[1], net_dst_id, net_slot)
+                             if source_stream.is_unit_call else 1)
                 obp.transport.sendto(
-                    self._obp_build_egress(obp, dmrd53, source_peer_id), obp.sockaddr)
+                    self._obp_build_egress(obp, dmrd53, source_peer_id, wire_slot), obp.sockaddr)
 
                 # Track the assumed TX stream so the dashboard draws an outbound
                 # pill and the stream ends cleanly (terminator or reaper backstop).
@@ -4473,6 +4485,10 @@ class HBProtocol(asyncio.DatagramProtocol):
             return
 
         dst_id = dmrd[8:11]                 # canonical TGID (wire == canonical)
+        if dmrd[15] & 0x40:                 # call type bit: a private (unit) call
+            if cfg.unit_calls:
+                self._handle_openbridge_unit_call(state, dmrd)
+            return
         local_ts = cfg.talkgroup_slots.get(dst_id)
         if local_ts is None:
             return                          # unmapped TGID -> dropped (fail-closed filter)
@@ -4525,8 +4541,75 @@ class HBProtocol(asyncio.DatagramProtocol):
                         f'packets={stream.packet_count}')
             self._emit_stream_end('openbridge', obp_name, local_ts, stream, 'terminator')
 
+    def _obp_unit_wire_slot(self, obp_name: str, dst_id: bytes, own_slot: int) -> int:
+        """The wire slot for a private call sent over an OpenBridge trunk: the slot the
+        called radio was last heard on through that trunk, else the call's own. So a
+        reply reaches the slot the caller is on at the far end."""
+        entry = self._user_cache.lookup(bytes_to_int(dst_id)) if self._user_cache else None
+        if entry is not None and entry.openbridge_name == obp_name:
+            return entry.slot
+        return own_slot
+
+    def _handle_openbridge_unit_call(self, state: 'OpenBridgeState', dmrd: bytes) -> None:
+        """A private (unit-to-unit) call in from an OpenBridge trunk (our fork, 2026-10-30).
+
+        Routed by radio ID like one from an outbound link: to where the called radio was
+        last heard, else to every unit-enabled repeater, never back out over any link.
+        It lands on the trunk's `unit_slot`; the caller is cached as reachable through
+        this trunk on the wire slot they called on, so a reply goes back on that slot.
+        """
+        cfg = state.config
+        obp_name = cfg.name
+        wire_slot = 2 if dmrd[15] & 0x80 else 1
+        local_ts = cfg.unit_slot
+        bits = (dmrd[15] | 0x80) if local_ts == 2 else (dmrd[15] & 0x7F)
+        if bits != dmrd[15]:
+            dmrd = dmrd[:15] + bytes([bits]) + dmrd[16:]
+        rf_src, dst_id = dmrd[5:8], dmrd[8:11]
+        peer_id, stream_id = dmrd[11:15], dmrd[16:20]
+        source = ('openbridge', obp_name)
+        now = time()
+        is_term = self._is_dmr_terminator(dmrd, (bits & 0x30) >> 4)
+
+        stream = state.streams.get(stream_id)
+        if stream is None:
+            targets, is_broadcast = self._calculate_unit_call_targets(
+                source_repeater_id=None, slot=local_ts, rf_src=rf_src, dst_id=dst_id,
+                stream_id=stream_id, source_openbridge_name=obp_name)
+            stream = StreamState(
+                repeater_id=peer_id, rf_src=rf_src, dst_id=dst_id, slot=local_ts,
+                start_time=now, last_seen=now, stream_id=stream_id, packet_count=1,
+                call_type='private', is_unit_call=True, is_broadcast_unit_call=is_broadcast,
+                target_repeaters=targets, routing_cached=True,
+            )
+            state.streams[stream_id] = stream
+            LOGGER.info(f'[OBP {obp_name}] RX unit call start src={bytes_to_int(rf_src)} '
+                        f'dst={bytes_to_int(dst_id)} wire TS{wire_slot} -> TS{local_ts} '
+                        f'stream_id={stream_id.hex()} targets={len(targets)}'
+                        f'{" [broadcast]" if is_broadcast else ""}')
+            self._emit_stream_start('openbridge', obp_name, local_ts, rf_src, dst_id,
+                                    stream_id, 'private',
+                                    remote_repeater_id=int.from_bytes(peer_id, 'big'))
+            if self._user_cache:
+                self._user_cache.update(radio_id=bytes_to_int(rf_src), repeater_id=0,
+                                        callsign='', slot=wire_slot,
+                                        talkgroup=bytes_to_int(dst_id),
+                                        openbridge_name=obp_name)
+        else:
+            stream.last_seen = now
+            stream.packet_count += 1
+
+        self._forward_stream(dmrd, source, local_ts, rf_src, dst_id, stream_id)
+
+        if is_term and not stream.ended:
+            stream.ended = True
+            stream.end_time = now
+            LOGGER.info(f'[OBP {obp_name}] RX unit call end stream_id={stream_id.hex()} '
+                        f'packets={stream.packet_count}')
+            self._emit_stream_end('openbridge', obp_name, local_ts, stream, 'terminator')
+
     def _obp_build_egress(self, state: 'OpenBridgeState', dmrd53: bytes,
-                          source_peer_id: bytes) -> bytes:
+                          source_peer_id: bytes, wire_slot: int = 1) -> bytes:
         """Frame a DMRD as a 73-byte OBP packet for this OBP.
 
         - Truncated to a canonical 53-byte DMRD: HBP repeater sources deliver
@@ -4537,11 +4620,15 @@ class HBProtocol(asyncio.DatagramProtocol):
           else our network_id (Brandmeister-spec behavior).
         - Wire slot forced to 1 (OBP convention; the far end derives its own
           local TS from its talkgroup_slots table). Bit 0x80 is the slot-2 flag.
+          A private call (our fork) carries `wire_slot` instead: there is no
+          talkgroup_slots entry for the far end to place it by.
         - HMAC-SHA1(passphrase, DMRD) appended.
         """
         cfg = state.config
         rptr_id = source_peer_id if cfg.preserve_source_peer else cfg.network_id.to_bytes(4, 'big')
-        bits = dmrd53[15] & ~0x80          # force slot 1 on the wire
+        bits = dmrd53[15] & ~0x80          # slot 1 on the wire
+        if wire_slot == 2:
+            bits |= 0x80
         dmrd = b''.join([dmrd53[:11], rptr_id, bytes([bits]), dmrd53[16:53]])
         return dmrd + hmac_new(self._obp_key(cfg.passphrase), dmrd, sha1).digest()
 

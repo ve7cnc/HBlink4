@@ -40,6 +40,9 @@ class UserEntry:
     last_heard: float = field(default_factory=time)
     talker_alias: Optional[str] = None
     outbound_name: Optional[str] = None
+    # OpenBridge trunk the user was heard through (our fork); `slot` is then the wire
+    # slot their call arrived on, which a reply to them goes back on.
+    openbridge_name: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization"""
@@ -52,6 +55,7 @@ class UserEntry:
             'last_heard': self.last_heard,
             'talker_alias': self.talker_alias,
             'outbound_name': self.outbound_name,
+            'openbridge_name': self.openbridge_name,
         }
 
 
@@ -80,7 +84,8 @@ class UserCache:
     
     def update(self, radio_id: int, repeater_id: int, callsign: str,
                slot: int, talkgroup: int, talker_alias: Optional[str] = None,
-               outbound_name: Optional[str] = None) -> None:
+               outbound_name: Optional[str] = None,
+               openbridge_name: Optional[str] = None) -> None:
         """
         Update cache with user activity.
 
@@ -97,13 +102,16 @@ class UserCache:
                 outbound instead of to any local repeater.
         """
         now = time()
-        source_desc = f'outbound "{outbound_name}"' if outbound_name else f'repeater {repeater_id}'
+        source_desc = (f'outbound "{outbound_name}"' if outbound_name
+                       else f'OpenBridge "{openbridge_name}"' if openbridge_name
+                       else f'repeater {repeater_id}')
 
         # Update or create entry
         if radio_id in self._cache:
             entry = self._cache[radio_id]
             entry.repeater_id = repeater_id
             entry.outbound_name = outbound_name
+            entry.openbridge_name = openbridge_name
             entry.callsign = callsign
             entry.slot = slot
             entry.talkgroup = talkgroup
@@ -121,6 +129,7 @@ class UserCache:
                 last_heard=now,
                 talker_alias=talker_alias,
                 outbound_name=outbound_name,
+                openbridge_name=openbridge_name,
             )
             LOGGER.debug(f'Added to cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
     
@@ -163,7 +172,7 @@ class UserCache:
             local repeater. None otherwise.
         """
         entry = self.lookup(radio_id)
-        if entry is None or entry.outbound_name is not None:
+        if entry is None or entry.outbound_name is not None or entry.openbridge_name is not None:
             return None
         return entry.repeater_id
 
@@ -174,6 +183,7 @@ class UserCache:
         Returns one of:
           - ('local', repeater_id: int)  — user last heard on a local repeater
           - ('outbound', name: str)       — user last heard via an outbound link
+          - ('openbridge', name: str)     — user last heard via an OpenBridge trunk
           - None                          — user not cached or cache expired
         """
         entry = self.lookup(radio_id)
@@ -181,6 +191,8 @@ class UserCache:
             return None
         if entry.outbound_name is not None:
             return ('outbound', entry.outbound_name)
+        if entry.openbridge_name is not None:
+            return ('openbridge', entry.openbridge_name)
         return ('local', entry.repeater_id)
     
     def cleanup(self) -> int:

@@ -106,6 +106,13 @@ class OpenBridgeConnectionConfig:
     # strict-spec peers that require network_id in RptrId.
     preserve_source_peer: bool = True
     description: str = ""
+    # Private (unit-to-unit) calls across this trunk (our fork, 2026-10-30). Off by
+    # default: OBP routes talkgroups, and a private call's destination is a radio ID that
+    # talkgroup_slots never lists. When on, an inbound private call lands on `unit_slot`
+    # here, and one sent out goes on the wire slot its called radio was last heard on
+    # this trunk (else its own slot), so a reply reaches the caller's slot at the far end.
+    unit_calls: bool = False
+    unit_slot: int = 2
 
     def __post_init__(self):
         """Validate required fields."""
@@ -118,6 +125,8 @@ class OpenBridgeConnectionConfig:
         if len(self.passphrase) > OBP_PASSPHRASE_MAX:
             raise ValueError(f"OpenBridge connection '{self.name}' passphrase is "
                              f"{len(self.passphrase)} characters; the maximum is {OBP_PASSPHRASE_MAX}")
+        if self.unit_slot not in (1, 2):
+            raise ValueError(f"OpenBridge connection '{self.name}' has invalid unit_slot: {self.unit_slot}")
         for label, p in (('local_port', self.local_port), ('target_port', self.target_port)):
             if p <= 0 or p > 65535:
                 raise ValueError(f"OpenBridge connection '{self.name}' has invalid {label}: {p}")
