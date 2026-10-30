@@ -109,3 +109,30 @@ def test_a_reply_goes_back_on_the_callers_wire_slot():
     assert d[15] & 0x80 and d[15] & 0x40                        # slot 2, still private
     g = p._obp_build_egress(st, _dmrd(3027, slot=2), (3020485).to_bytes(4, 'big'))[:53]
     assert not g[15] & 0x80                                      # group: slot 1, as before
+
+
+def test_without_flood_an_unheard_radio_is_never_flooded_to_local_repeaters(monkeypatch):
+    import hblink4.hblink as H
+    monkeypatch.setitem(H.CONFIG, 'global', {**H.CONFIG.get('global', {}), 'unit_call_flood': False})
+    st = _state('A')
+    p = _protocol(st)
+    local = Mock(connection_state='connected', unit_calls_enabled=True)
+    p._repeaters = {(3020485).to_bytes(4, 'big'): local, (3021111).to_bytes(4, 'big'): local}
+    p._is_slot_busy = lambda *a, **k: False
+    # From a hotspot: only up the trunk, where the cores know where it was heard.
+    targets, broadcast = p._calculate_unit_call_targets(
+        (3020485).to_bytes(4, 'big'), 2, (3020485).to_bytes(3, 'big'),
+        (3027999).to_bytes(3, 'big'), b'\x01\x02\x03\x06')
+    assert targets == {('openbridge', 'A')}
+    # From the trunk: nowhere.
+    targets, _ = p._calculate_unit_call_targets(
+        None, 2, (3027004).to_bytes(3, 'big'), (3027999).to_bytes(3, 'big'),
+        b'\x01\x02\x03\x07', source_openbridge_name='A')
+    assert targets == set()
+    # A radio heard on a hotspot still goes straight there.
+    p._user_cache.update(radio_id=3027999, repeater_id=3021111, callsign='', slot=2,
+                         talkgroup=3027)
+    targets, broadcast = p._calculate_unit_call_targets(
+        None, 2, (3027004).to_bytes(3, 'big'), (3027999).to_bytes(3, 'big'),
+        b'\x01\x02\x03\x08', source_openbridge_name='A')
+    assert targets == {(3021111).to_bytes(4, 'big')} and not broadcast

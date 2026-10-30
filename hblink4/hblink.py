@@ -2644,8 +2644,18 @@ class HBProtocol(asyncio.DatagramProtocol):
         # plus every unit-enabled outbound except source when call originated
         # locally. Unit calls sourced from an outbound only broadcast to
         # local repeaters (anti-loop).
+        #
+        # global unit_call_flood false (our fork): a radio not heard here is never
+        # flooded to every local repeater, which would hold that slot on all of
+        # them. From a link, the call goes nowhere; from a local repeater, only up
+        # the links (outbound, OpenBridge), whose far end knows where it was heard.
+        flood = CONFIG.get('global', {}).get('unit_call_flood', True)
         target_set: set = set()
-        for target_id, target_repeater in self._repeaters.items():
+        if not flood and from_outbound:
+            LOGGER.info(f'UNIT CALL to {dst_int} not forwarded: not heard here '
+                        f'(unit_call_flood off)')
+            return (target_set, False)
+        for target_id, target_repeater in (self._repeaters.items() if flood else ()):
             if target_id == source_repeater_id:
                 continue
             if target_repeater.connection_state != 'connected':
