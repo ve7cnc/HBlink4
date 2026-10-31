@@ -1380,6 +1380,9 @@ class HBProtocol(asyncio.DatagramProtocol):
             'is_assumed': stream.is_assumed,
             'is_data': emit_is_data,
         }
+        rf_quality = stream.rf_quality()
+        if rf_quality is not None:
+            event_data['rf_quality'] = rf_quality
         
         if connection_type == 'repeater':
             event_data['repeater_id'] = int(connection_id) if isinstance(connection_id, str) else connection_id
@@ -4164,6 +4167,11 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Get the current stream for this slot (after _handle_stream_packet has updated it)
         current_stream = repeater.get_slot_stream(_slot)
 
+        # BER/RSSI describe voice bursts only (frame types 0 and 1): a header's
+        # or terminator's zero BER is not a perfect sample.
+        if current_stream and not current_stream.is_assumed and _frame_type in (0, 1):
+            current_stream.add_rf_sample(packet['ber_errors'], packet['rssi_dbm'])
+
         # Data streams are tracked (so fast-terminator/contention logic stays
         # quiet) and emitted to the dashboard, but never forwarded. Drop here
         # before the forwarding path and before stream_update telemetry —
@@ -4187,15 +4195,20 @@ class HBProtocol(asyncio.DatagramProtocol):
         
         # Emit stream_update every 60 packets (10 superframes = 1 second)
         if current_stream and not current_stream.ended and current_stream.packet_count % 60 == 0:
-            self._events.emit('stream_update', {
+            update_data = {
                 'repeater_id': rid_to_int(repeater_id),
                 'slot': _slot,
                 'src_id': int.from_bytes(current_stream.rf_src, 'big'),
                 'dst_id': int.from_bytes(current_stream.dst_id, 'big'),
+                'stream_id': current_stream.stream_id.hex(),
                 'duration': round(time() - current_stream.start_time, 2),
                 'packets': current_stream.packet_count,
                 'call_type': current_stream.call_type
-            })
+            }
+            rf_quality = current_stream.rf_quality()
+            if rf_quality is not None:
+                update_data['rf_quality'] = rf_quality
+            self._events.emit('stream_update', update_data)
         
         # Stream end detection: terminator (primary) or timeout (fallback)
         # Hang time prevents slot hijacking during conversations

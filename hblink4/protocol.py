@@ -27,6 +27,8 @@ def parse_dmr_packet(data: bytes) -> Optional[Dict[str, Any]]:
         - byte 15: Bits field (slot, call type, frame type)
         - bytes 16-19: Stream ID (4 bytes)
         - bytes 20-52: DMR payload (33 bytes)
+        - byte 53: BER, corrected bits in a voice burst's 141 protected bits
+        - byte 54: RSSI magnitude in dBm (70 = -70 dBm; 0 = not reported)
     """
     if len(data) < 55:
         return None
@@ -43,7 +45,9 @@ def parse_dmr_packet(data: bytes) -> Optional[Dict[str, Any]]:
         'frame_type': (data[15] & 0x30) >> 4,
         'src_id_int': int.from_bytes(data[5:8], 'big'),
         'dst_id_int': int.from_bytes(data[8:11], 'big'),
-        'repeater_id_int': int.from_bytes(data[11:15], 'big')
+        'repeater_id_int': int.from_bytes(data[11:15], 'big'),
+        'ber_errors': data[53],
+        'rssi_dbm': -data[54] if data[54] else None
     }
 
 

@@ -22,6 +22,10 @@ from time import time
 from random import randint
 from typing import Optional, Tuple, Dict, Any
 
+# Protected bits in a DMR voice burst (3 AMBE frames: 3 x (24 + 23) bits). An
+# MMDVM device reports how many of them its FEC corrected in DMRD byte 53.
+DMR_VOICE_PROTECTED_BITS = 141
+
 # Import utils functions that these models depend on
 try:
     from .utils import safe_decode_bytes, PeerAddress
@@ -178,6 +182,46 @@ class StreamState:
     # BPTC encode per (dst, src) for the life of the stream.
     lc_base: Optional[bytes] = None
     lc_cache: Dict[Tuple[bytes, bytes], Any] = field(default_factory=dict)
+
+    # RF quality of a stream we received from a hotspot or repeater: DMRD
+    # byte 53 (BER) and byte 54 (RSSI) of its voice bursts. Assumed (TX)
+    # streams never get any: we have no measurement for what we send.
+    ber_error_total: int = 0
+    ber_samples: int = 0
+    ber_peak: int = 0
+    rssi_total: int = 0
+    rssi_samples: int = 0
+    rssi_min: Optional[int] = None
+    rssi_max: Optional[int] = None
+
+    def add_rf_sample(self, ber_errors: int, rssi_dbm: Optional[int]) -> None:
+        """One voice burst's BER (corrected bits, 0 is a perfect burst) and RSSI
+        (negative dBm, None when the device does not report it)."""
+        if 0 <= ber_errors <= DMR_VOICE_PROTECTED_BITS:
+            self.ber_error_total += ber_errors
+            self.ber_samples += 1
+            self.ber_peak = max(self.ber_peak, ber_errors)
+        if rssi_dbm is not None:
+            self.rssi_total += rssi_dbm
+            self.rssi_samples += 1
+            self.rssi_min = rssi_dbm if self.rssi_min is None else min(self.rssi_min, rssi_dbm)
+            self.rssi_max = rssi_dbm if self.rssi_max is None else max(self.rssi_max, rssi_dbm)
+
+    def rf_quality(self) -> Optional[Dict[str, Any]]:
+        """The stream's RF quality so far for events, or None with no samples.
+        BER in percent of protected bits; RSSI in dBm, each only when reported."""
+        q: Dict[str, Any] = {}
+        if self.ber_samples:
+            q['ber_average_percent'] = round(
+                self.ber_error_total * 100.0 / (DMR_VOICE_PROTECTED_BITS * self.ber_samples), 2)
+            q['ber_peak_percent'] = round(self.ber_peak * 100.0 / DMR_VOICE_PROTECTED_BITS, 2)
+            q['ber_samples'] = self.ber_samples
+        if self.rssi_samples:
+            q['rssi_average_dbm'] = round(self.rssi_total / self.rssi_samples, 1)
+            q['rssi_min_dbm'] = self.rssi_min
+            q['rssi_max_dbm'] = self.rssi_max
+            q['rssi_samples'] = self.rssi_samples
+        return q or None
 
     def is_active(self, timeout: float = 2.0) -> bool:
         """Check if stream is still active (within timeout period)"""
